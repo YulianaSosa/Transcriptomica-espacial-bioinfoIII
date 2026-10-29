@@ -1,0 +1,490 @@
+---
+title: "Transcriptómica espacial de datos de cerebro"
+author: "Diana Barrientos, Román Cervantes, Yuliana Sosa"
+date: "`r Sys.Date()`"
+lang: es
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    toc_float: true
+    number_sections: true
+---
+
+```{r setup, include=FALSE}
+# Dejo eval = FALSE para poder knitear el documento sin correr todo el análisis
+# (descarga datos, tarda y usa bastante RAM). Si quiero ejecutar de verdad,
+# cambio a TRUE o corro los bloques a mano en el orden que explico abajo.
+knitr::opts_chunk$set(echo = TRUE, eval = TRUE, message = FALSE, warning = FALSE)
+```
+
+
+## Descarga del dataset
+
+```{r}
+getwd()
+```
+
+
+
+```{r descarga}
+# Los archivos ya se descargaron desde la terminal con wget, dentro de:
+# /Users/romaan/brain_cancer_data/glioblastoma_data/
+#desde la terminal cree el directorio brain_cancer_data donde se encuentra este Rmd y también el subdirectorio glioblastoma_data donde están cargados los datos con wget:
+# get https://cf.10xgenomics.com/samples/spatial-exp/2.0.1/CytAssist_11mm_FFPE_Human_Glioblastoma/CytAssist_11mm_FFPE_Human_Glioblastoma_filtered_feature_bc_matrix.tar.gz
+#wget https://cf.10xgenomics.com/samples/spatial-exp/2.0.1/CytAssist_11mm_FFPE_Human_Glioblastoma/CytAssist_11mm_FFPE_Human_Glioblastoma_spatial.tar.gz 
+
+# Dataset: https://www.10xgenomics.com/datasets/11mm-capture-area-ffpe-human-glioblastoma-probe-based-whole-transcriptome-profiling-1-standard
+
+# knitr usa como directorio de trabajo la carpeta del Rmd (brain_cancer_data/).
+# Para correr esto, hay que asegurarse de estar en (con getwd puedes ver dónde estás parado):
+# setwd("/Users/romaan/brain_cancer_data")
+getwd()
+
+data_dir <- "glioblastoma_data/"
+list.files(data_dir)   # deben aparecer los dos .tar.gz
+
+# DescomprimIr los archivos (se crean las carpetas dentro de glioblastoma_data/)
+untar(tarfile = file.path(data_dir, "CytAssist_11mm_FFPE_Human_Glioblastoma_filtered_feature_bc_matrix.tar.gz"),
+      exdir = data_dir)
+
+untar(tarfile = file.path(data_dir, "CytAssist_11mm_FFPE_Human_Glioblastoma_spatial.tar.gz"),
+      exdir = data_dir)
+
+# Reviso que quedó todo en su lugar
+list.files(data_dir)
+list.files(file.path(data_dir, "filtered_feature_bc_matrix"))
+list.files(file.path(data_dir, "spatial"))
+```
+
+Para descomprimir alternativa:
+Otra opción es hacerlo desde la terminal, parado en `/Users/romaan/brain_cancer_data/glioblastoma_data`:
+
+```bash
+tar -xzf CytAssist_11mm_FFPE_Human_Glioblastoma_filtered_feature_bc_matrix.tar.gz
+tar -xzf CytAssist_11mm_FFPE_Human_Glioblastoma_spatial.tar.gz
+```
+
+
+```{r instrucciones}
+library(Giotto)
+
+instructions <- createGiottoInstructions(save_dir = "visium_plots", #guardaremos las imágenes en este directorio
+                                         save_plot = TRUE,
+                                         show_plot = TRUE,
+                                         return_plot = FALSE,
+                                         python_path = NULL # alternativamente, "/local/python/path/python" 
+                                         )
+```
+
+
+## Crear el objeto Giotto
+
+Se lee la carpeta de Visium y se arma un objeto con la matriz de cuentas, las coordenadas, los metadatos y la imagen del tejido. 
+
+```{r crear_objeto}
+data_path <- "glioblastoma_data/"
+
+visium_brain_old <- createGiottoVisiumObject(visium_dir = data_path, ##le damos el path necesario de visum, utiliza la matriz de cuentas + coordenadas de spots y metadatos para armar este objeto
+                                         expr_data = "filter", #usa la matriz de expresion filtrada
+                                         png_name = "tissue_lowres_image.png", #indica la imagen del tejido que se debe asociar al los datos para darle contexto espacial
+                                         gene_column_index = 2, #os genes están en la segunda columna del archivo de feaatures
+                                         instructions = instructions) #llama la config de arriba que hicimos para las imágenes
+```
+
+## Alternativa
+
+Otra forma de armar el mismo objeto, pero desde la matriz con get10Xmatrix, las coordenadas desde un csv y los metadatos desde otro csv. Sirve cuando mis datos no vienen en la estructura estándar de Space Ranger (por ejemplo vienen de otro pipeline).
+
+```{r}
+# Crea la matriz de expresión
+expression_matrix <- get10Xmatrix("glioblastoma_data/filtered_feature_bc_matrix/",
+                                  gene_column_index = 2) ##digo en que columna se encuentran los genes y en esta variable se gaurdará el resultado, son todos los barcodes incluso no los filtrados
+
+# le doy la info espacial:
+spatial_results <- data.table::fread("glioblastoma_data/spatial/tissue_positions.csv")  #convierte en tabla
+colnames(spatial_results) <- c(
+    "cell_ID", "in_tissue", "array_row",
+    "array_col", "col_pxl", "row_pxl"
+) #explica que es cada columna y las nombra
+
+```
+
+Al hacer esto, tuvimos un error donde las coordenadas espaciales no coinciden con el número de identificadores celulares de la matriz de expresión, por lo tanto, hacemos lo siguiente para filtrar las coordenadas y que coincidan:
+
+```{r}
+# Conserva únicamente las posiciones que aparecen en la matriz
+spatial_results <- spatial_results[
+    cell_ID %in% colnames(expression_matrix)
+]
+
+# Comprueba que ahora coincidan
+nrow(spatial_results)
+ncol(expression_matrix)
+```
+
+Ahora tienen la misma dimensión y podemos seguir con spatial locs:
+```{r}
+# Crea las coordenadas
+spatial_locs <- spatial_results[, .(
+    cell_ID,
+    sdimx = row_pxl,
+    sdimy = -col_pxl #dénde esta cada spot
+)] 
+
+# Crea los metadatos
+cell_metadata <- spatial_results[, .(
+    cell_ID,
+    in_tissue
+)] #características de cada spot
+```
+
+Al ya no tener error, podemos seguir:
+```{r}
+# Crea el objeto
+visium_object <- createGiottoObject(expression = expression_matrix, #incorpora los conteos de expresión génica
+                                    spatial_locs = spatial_locs) #coordenadas espaciales
+
+visium_object <- addCellMetadata(visium_object, #añade metadados al objeto existente
+                                 new_metadata = cell_metadata,
+                                 by_column = TRUE) #los identificadores de los spots se utilizan para asociar los metadatos con las unidades espaciales del objeto
+
+spatPlot2D(visium_object, #objeto a visualizar
+           cell_color = "in_tissue") #asigna colorcitos a spots
+```
+
+## Ver el objeto
+
+```{r explora_resumen}
+visium_object
+
+# ver la matriz de expresión
+showGiottoExpression(visium_object)
+
+# muestra metadatos por spot
+showGiottoCellMetadata(visium_object)
+```
+
+Aquí se busca cuántos spots y genes hay, qué matrices existen y qué columnas trae el metadato.
+Podemos ver que las moléculas son de RNA por ejemplo.
+
+### Exportar y reimportar metadatos y coordenadas
+
+Sr guardan los metadatos del objeto viejo en un csv, los vuelvo a leer y se agregan a visium_object.
+
+```{r explora_exportar}
+cell_metadata <- pDataDT(visium_brain_old)  #obtiene la tabla de metadatos asociados al objeto visium_brain_old
+
+write.csv(cell_metadata, "cell_metadata.csv", #csv que se lee
+          quote = FALSE, row.names = TRUE)
+
+cell_metadata <- read.csv("cell_metadata.csv", #lee el archivo recién creado
+                          header = TRUE, row.names = 1)
+
+visium_object <- addCellMetadata(visium_object, #añadimos metadata a este nuevo objeto
+                                new_metadata = cell_metadata, #col spots, filas info genes, transcritos
+                                by_column = TRUE)
+
+getCellMetadata(visium_object) #comprueba mi metadata
+pDataDT(visium_object) #imprime la tabla de metadatos
+
+spatial_locs <- getSpatialLocations(visium_brain_old,
+                                    output = "data.table") # escribe dónde está cada spot
+
+write.csv(spatial_locs, "spatial_locs.csv", quote = FALSE,
+          row.names = FALSE) #lo guarda en archivo csv
+```
+
+El csv debería tener: ID del spot y coordenadas X, Y.
+
+### Genes, imágenes y redducción
+
+Primero se comprueba: metadatos de genes, nombres de imágenes guardadas, reducciones de dimensión existentes e instrucciones del objeto.
+
+```{r explora_resto}
+# Metadatos de los genes/proteínas
+showGiottoFeatMetadata(visium_object)
+
+# Imágenes
+showGiottoImageNames(visium_object) #muestra las imagenes, por problema de terra no se renderiza
+
+# Reducción de dimensiones
+showGiottoDimRed(visium_object) # Reducción de dimensiones que no se visualiza por los errores
+
+# Instrucciones
+instructions(visium_object)
+```
+Metadatos de genes y reducciones estarán casi vacíos por ahora poruqe todavía no hay PCA.
+
+## Filtrar los spots que están sobre el tejido
+
+Primero grafico todos los spots coloreados por in_tissue (gris = fuera de tejido, azul = sobre tejido). Luego tomo del metadato los barcodes con in_tissue == 1, hago un subconjunto y vuelvo a graficar para confirmar que solo quedan los azules.
+
+```{r en_tejido}
+spatPlot2D(gobject = visium_object, #crea una grafica en 2D, aqui se indica el objeto q tiene los datos
+           cell_color = "in_tissue", #colorea losspots segun esta variable
+           point_size = 1,
+           cell_color_code = c("0" = "lightgrey", "1" = "blue"), #cuando es 0 pintará gris y si es 1 azul
+           show_image = FALSE, 
+           image_name = "image")
+
+cell_metadata <- pDataDT(visium_object) #obtener metadata del objeto
+in_tissue_barcodes <- cell_metadata[in_tissue == 1]$cell_ID #solo queremos los spots que cuenten con tejhido
+
+visium_brain <- subsetGiotto(visium_object, 
+                             cell_ids = in_tissue_barcodes) #crea un objeto únicamente con los spots que seleccionamos arriba, que termina siendo un subconjunto y se ponen los indicadores
+
+spatPlot2D(gobject = visium_brain, #igual grafica en 2D pero con nuestro subset de interés, el nuevo objeto
+           cell_color = "in_tissue", 
+           point_size = 1,
+           cell_color_code = c("0" = "lightgrey", "1" = "blue"), 
+           show_image = FALSE, 
+           image_name = "image")
+```
+En nuestro caso, podemos ver que únicamente teníamos spots de color azul, lo cual significa que no hay spots que estén fuera del área indicada como tejido (azul).
+
+
+Antes del control de calidad, veamos cuántas células tenemos:
+```{r}
+nrow(pDataDT(visium_brain))
+```
+
+
+## Control de calidad
+
+```{r qc}
+# Crea un objecto con el número de genes y transcritos por spot
+visium_brain_statistics <- addStatistics(gobject = visium_brain,
+                                         expression_values = "raw")
+
+pDataDT(visium_brain_statistics) #tabla de mis estadísticas
+
+spatPlot2D(gobject = visium_brain_statistics, 
+           cell_color = "nr_feats", 
+           point_size = 1,
+           color_as_factor = FALSE) #objeto 2D pero ya tomando en cuenta mis genes y transcritos por spot
+
+# Distribución de genes por spot para detectar los que salen con valores bajos
+filterDistributions(gobject = visium_brain_statistics, 
+                    detection = "cells")
+
+# Distribución del número de features detectados por spots, para identificar spots con muy pocos genes o valores atípicos
+filterDistributions(gobject = visium_brain_statistics, 
+                    detection = "feats")
+
+# Evalúa diferentes puntos de corte al filtrar
+filterCombinations(gobject = visium_brain_statistics, # evalúa distintas combinaciones de umbrales de filtrado para ver cómo afectan la cantidad de genes y spots que se conservan
+                   expression_thresholds = c(1, 2, 3),
+                   feat_det_in_min_cells = c(50, 100, 200),
+                   min_det_feats_per_cell = c(500, 1000, 1500))
+```
+
+###Explicación de las gráficas:
+1) pinta segun el número de genes diferentes detectados en cada spot, mientras mas rojitos mas genes diferentes detctados en es espot, mientras mas azulito menos genes diferentes
+2) es la distribución de cuántos genes detecto por cada spot, valore smuy bajitos es que son spots con muy pocos genes detectados mientras que spots con valores muy altos tienen muchos genes detectados
+3 ) que tantos spots presentan un feature que en este caso es cantidad de genes, un pico alto es que hay una gran cantidad de genes que solo se expresan en una cantidad pequeña de spots, hay genes que se expresan en gran cantidad de spots por lo cual estos pueden ser hosuekeeping
+4) son todas las combinaciones posibles de cortes para filtrar, se busca un calance entre el numero de spots que se remueven con el numero de features o genes qeu se remueven por lo cual los clusters 1 y 3 son muy laxos y estrictos respectivamente, el cluster 2 serían valores con mejores thresholds
+
+## Filtrado
+
+Un gen cuenta como detectado en un spot si tiene al menos 1 transcrito. Nos quedaremos solo con genes detectados en al menos 50 spots y solo con spots que tengan al menos 1000 genes detectados:
+
+```{r filtrado}
+#aquí aplicamos filtros mencionados en el párrafo de arriba
+visium_brain <- filterGiotto(gobject = visium_brain,
+                             expression_threshold = 1,
+                             feat_det_in_min_cells = 50,
+                             min_det_feats_per_cell = 1000,
+                             expression_values = "raw",
+                             verbose = TRUE)
+```
+
+Número de células tras filtrar po calidad:
+```{r}
+nrow(pDataDT(visium_brain))
+```
+
+
+
+## Normalización
+
+Escalamos cada spot a un total común (scalefactor = 6000) porque 6000 es el valor por defecto de Giotto. aplicamos transformación logarítmica y además generamos una versión escalada que más adelante se usa. Los resultados se guardan en el objeto junto con la matriz cruda.
+
+```{r normalizacion}
+visium_brain <- normalizeGiotto(gobject = visium_brain, 
+                                scalefactor = 6000, 
+                                verbose = TRUE)
+```
+
+
+## Estadísticas después de la normalización
+
+Volvemos a calcular los estadísticos de antes pero ahora con el objeto ya filtrado y normalizado y graficamos el objeto por nr_feats, que permite ver diversidad de expresión génica en los spots. Un valor bajo puede reflejar poca cantidad de RNA
+
+```{r estadisticas}
+visium_brain <- addStatistics(gobject = visium_brain)
+
+spatPlot2D(gobject = visium_brain, 
+           show_image = FALSE,
+           point_size = 1,
+           point_alpha = 0.7,
+           cell_color = "nr_feats", 
+           color_as_factor = FALSE)
+```
+
+Ahora los valores bajos deberían haber desaparecido y se observa más variación biológica real. 
+En cerebro, regiones con más genes detectados suelen corresponder a neuronas, mientras que menos genes puede ser sustancia blanca.
+
+## Genes altamente variables (HVF)
+
+Con `save_plot = TRUE` cada método guarda su gráfico en `visium_plots/`.
+
+```{r hvf}
+# Regresión de Loess es usada cuando la relación entre la expresión promedio
+# y la varianza son no lineales o pueden ser descritas por un modelo no paramétrico
+
+visium_brain <- calculateHVF(gobject = visium_brain, 
+                             method = "cov_loess",
+                             save_plot = TRUE)
+
+# Residuales Pearson son usados para la estabilización de la varianza 
+# (para lidiar con el ruido técnico) y resaltar los genes con alta dispersión
+
+visium_brain <- calculateHVF(gobject = visium_brain, 
+                             method = "var_p_resid",
+                             save_plot = TRUE)
+
+# Grupos de covarianza (default), son usagos cuando la variabilidad de la expresión 
+# difiere a través de los niveles de expresión o las regiones espaciales, sin
+# asumir una relación específica entre la expresión promedio y la varianza.
+
+visium_brain <- calculateHVF(gobject = visium_brain, 
+                             method = "cov_groups",
+                             save_plot = TRUE)
+```
+
+En cada gráfico los genes marcados como HVF son los que se separan de la nube general. Se buscan principalmente genes que sean marcadores de un tejido en específico.
+
+## Reducción de dimensiones: PCA
+
+```{r pca}
+visium_brain <- runPCA(gobject = visium_brain) #resume la matriz de expresión (solo con los HVF) en componentes principales
+
+screePlot(gobject = visium_brain, 
+          ncp = 30) #muestra cuánta varianza explica cada componente de los primeros 30
+
+plotPCA(gobject = visium_brain) #grafica los spots en PC1 vs PC2
+```
+
+En el scree plot bsucamos el codo: a partir de ahí los componentes aportan poca varianza y probablemente son ruido. 
+
+En el PCA, los spots que quedan en grupos pueden tener una estructura biológica.
+
+## UMAP
+
+Calculamos una proyección de los spots usando los primeros 10 componentes principales:
+
+```{r umap}
+visium_brain <- runUMAP(visium_brain, 
+                        dimensions_to_use = 1:10) #crea un UMAP, cada punto es un spot los spots que caen juntos son lso que comparten un perfil de expresión génica muy parecido. lo hace sobre los PC para no tener tantas dimensiones por la cantidad de genes pero si guardar su info
+
+plotUMAP(gobject = visium_brain) # imprime el UMAP
+```
+Spots cercanos en el UMAP tienen perfiles de expresión parecidos (aunque las distancias entre grupos y el tamaño no son cuantificables) y UMAP sirve solo para visualizar.
+
+## tSNE
+
+Ahora otro método de proyección no lineal.
+
+```{r tsne}
+visium_brain <- runtSNE(visium_brain, 
+                        dimensions_to_use = 1:10)
+#similar al UMAP pero agrupa puntos muy cercanos en el espacio original
+plotTSNE(gobject = visium_brain)
+```
+
+
+
+## Vecinos cercanos
+
+Construimos grafos de vecinos entre spots sobre los primeros 10 PCs con k = 15.
+
+```{r vecinos}
+#estas son las formas de encontrar a los vecinitos más cercanos segón diferentes métodos
+
+# sNN network (default)
+visium_brain <- createNearestNetwork(gobject = visium_brain, 
+                                     dimensions_to_use = 1:10, 
+                                     k = 15)
+
+# K-Nearest Neighbors (kNN)
+visium_brain <- createNearestNetwork(gobject = visium_brain, 
+                                     dimensions_to_use = 1:10, 
+                                     k = 15,
+                                     type = "kNN")
+
+#es importante aclarar que se sobreescribe el resultado de sNN ahora en kNN, pues se usa la misma variable. Al agregar kNN, el resultado de sNN se borra y se conserva el de kNN (que es el que usaremos abajo)
+```
+
+
+## Clustering de Leiden
+
+Con leiden agrupamos los spots detectando comunidades en la red de vecinos. Con resoltion 0.4:más resolución --> más clusters. 
+Después se observa en PCA, UMAP, tSNE ysobre el tejido con spatPlot2D. 
+
+El último gráfico resalta un cluster concreto, el "8", en rojo y deja el resto en gris como ejemplo.
+
+```{r leiden}
+visium_brain <- doLeidenCluster(gobject = visium_brain, 
+                                resolution = 0.2, 
+                                n_iterations = 1000)
+#probamos diferentes resoluciones para ajustar el número de clusters. Acordamos 0.2, generando 13 clusters, que es un punto intermedio, ya que con 0.4 se generan 18 clusters, donde ya la separación no necesariamente es real.
+#construye un grafo de vecinos cercanos (K-nearest neighbor graph) basándose en la reducción de dimensionalidad previa (los componentes principales)
+
+plotPCA(gobject = visium_brain,
+        cell_color = "leiden_clus") #plotea
+
+#otra forma de plotear  los vecinos con UMAP, usa la red de vecinos que se generó a  partir de  PC y genera grafos,  cada línea conecta un spot con aquellos otros spots que tienen perfiles de expresión génica más similares (sus "vecinos más cercanos")
+
+plotUMAP(gobject = visium_brain,
+         cell_color = "leiden_clus", 
+         show_NN_network = TRUE, 
+         point_size = 2.5)
+#hay 18 clusters
+
+#plotea según el método de tSNE que es según cercanía en el espacio, las líneas entre clusters se leen de la misma manera
+plotTSNE(gobject = visium_brain,
+         cell_color = "leiden_clus", 
+         show_NN_network = TRUE, 
+         point_size = 2.5)
+#mantiene el espacio del tejido y agrupa con colores y dice que tan similares son en su perfil
+spatPlot2D(visium_brain, 
+           cell_color = "leiden_clus", #pinta cada spot con el color de su cluste
+           point_size = 1, #ajusta el tamaño visual de los puntos en la gráfica
+           coord_fix_ratio = 1) #mantiene la misma escala en ambos ejes para que no se distorsione
+#cada cluster represneta un perfil transcripcional diferente, es la anatomia celular de nuestro cerebro
+
+# Podemos resaltar un grupo de interés
+#un ejemplo de como resaltar un cluster en este caso el 7 porque es el que vemos que tiene una mayor expresión de genes:
+spatPlot2D(visium_brain, 
+           cell_color = "leiden_clus",
+           select_cell_groups = "7", 
+           point_size = 1,
+           coord_fix_ratio = 1, 
+           show_other_cells = TRUE,
+           cell_color_code = c("7" = "red"), 
+           other_cell_color = "grey")
+```
+
+## Conclusión
+Pudimos concluir que en general los datos poseen una buena calidad, debido al filtrado de spots que se mantuvo consistente.
+
+También, es conveniente utilizar grupos de covarianza para identificar los genes altamente variables debido a que agrupa los genes por su nivel de expresión, y permite una comparación más precisa respecto a su variación.
+
+Por otro lado, la reducción de dimensionalidad ayuda a observar una separación de los datos, lo cual sería conveniente revisar con la información biológica en un futuro.
+
+El clustering nos permite visualizar 13 grupos, los cuales poseen posiciones claras dentro del tejido. Resultaría interesante observar si dentro de los grupos se puede identificar un tipo celular modificado por el cáncer del paciente. 
+
+Una región que nos llamó la atención analizar es la zona 7, donde observamos que había una mayor expresión de genes. Esto nos podría indicar que el tejido tiene una alta complejidad funcional o gran demanda metabólica. Por lo que sería interesante observar la expresión en esa zona. 
+
+El análisis futuro con scRNA-seq y enriquecimiento de tipos celulares nos podría dar más información acerca de la estructura y genes expresados dentro de las células del tumor cerebral.
